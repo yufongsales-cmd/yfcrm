@@ -37,6 +37,16 @@ IMAGE_EXTENSIONS = {
     ".webp",
 }
 INPUT_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
+LANGUAGE_OPTIONS: Dict[str, str] = {
+    "繁體中文（台灣）": "chinese_cht",
+    "簡體中文": "ch",
+    "英文": "en",
+    "日文": "japan",
+    "韓文": "korean",
+    "拉丁語系": "latin",
+    "阿拉伯語系": "arabic",
+    "西里爾語系": "cyrillic",
+}
 
 
 @dataclass
@@ -89,7 +99,7 @@ def box_to_string(box: Any) -> str:
 class PaddleOcrGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("PaddleOCR GUI")
+        self.root.title("PaddleOCR 圖片文字辨識")
         self.root.geometry("1040x700")
         self.root.minsize(900, 560)
 
@@ -101,9 +111,9 @@ class PaddleOcrGui:
         self.worker: Optional[threading.Thread] = None
         self.events: "queue.Queue[tuple]" = queue.Queue()
 
-        self.language_var = tk.StringVar(value="ch")
+        self.language_var = tk.StringVar(value="繁體中文（台灣）")
         self.orientation_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="就緒")
 
         self._build_ui()
         self._configure_drag_drop()
@@ -119,41 +129,41 @@ class PaddleOcrGui:
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         toolbar.columnconfigure(8, weight=1)
 
-        self.add_button = ttk.Button(toolbar, text="Add Files", command=self.add_files)
+        self.add_button = ttk.Button(toolbar, text="加入檔案", command=self.add_files)
         self.add_button.grid(row=0, column=0, padx=(0, 6))
 
-        self.clear_button = ttk.Button(toolbar, text="Clear", command=self.clear_files)
+        self.clear_button = ttk.Button(toolbar, text="清除", command=self.clear_files)
         self.clear_button.grid(row=0, column=1, padx=(0, 16))
 
-        ttk.Label(toolbar, text="Language").grid(row=0, column=2, padx=(0, 4))
+        ttk.Label(toolbar, text="辨識語言").grid(row=0, column=2, padx=(0, 4))
         self.language_box = ttk.Combobox(
             toolbar,
             textvariable=self.language_var,
-            width=12,
+            width=18,
             state="readonly",
-            values=("ch", "en", "japan", "korean", "latin", "arabic", "cyrillic"),
+            values=tuple(LANGUAGE_OPTIONS.keys()),
         )
         self.language_box.grid(row=0, column=3, padx=(0, 12))
         self.language_box.bind("<<ComboboxSelected>>", self._reset_ocr)
 
         self.orientation_check = ttk.Checkbutton(
             toolbar,
-            text="Text orientation",
+            text="偵測文字方向",
             variable=self.orientation_var,
             command=self._reset_ocr,
         )
         self.orientation_check.grid(row=0, column=4, padx=(0, 16))
 
-        self.run_button = ttk.Button(toolbar, text="Run OCR", command=self.run_ocr)
+        self.run_button = ttk.Button(toolbar, text="開始辨識", command=self.run_ocr)
         self.run_button.grid(row=0, column=5, padx=(0, 6))
 
         self.save_txt_button = ttk.Button(
-            toolbar, text="Save TXT", command=self.save_txt
+            toolbar, text="匯出 TXT", command=self.save_txt
         )
         self.save_txt_button.grid(row=0, column=6, padx=(0, 6))
 
         self.save_xlsx_button = ttk.Button(
-            toolbar, text="Save XLSX", command=self.save_xlsx
+            toolbar, text="匯出 Excel", command=self.save_xlsx
         )
         self.save_xlsx_button.grid(row=0, column=7, padx=(0, 6))
 
@@ -161,7 +171,7 @@ class PaddleOcrGui:
         left.grid(row=1, column=0, sticky="nsw", padx=(0, 12))
         left.rowconfigure(1, weight=1)
 
-        ttk.Label(left, text="Input files").grid(row=0, column=0, sticky="w")
+        ttk.Label(left, text="檔案清單").grid(row=0, column=0, sticky="w")
         list_frame = ttk.Frame(left)
         list_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
         list_frame.rowconfigure(0, weight=1)
@@ -176,10 +186,10 @@ class PaddleOcrGui:
         file_scroll.grid(row=0, column=1, sticky="ns")
         self.file_list.configure(yscrollcommand=file_scroll.set)
 
-        ttk.Label(left, text="Preview").grid(row=2, column=0, sticky="w")
+        ttk.Label(left, text="預覽").grid(row=2, column=0, sticky="w")
         self.preview_label = ttk.Label(
             left,
-            text="No image selected",
+            text="尚未選擇圖片",
             anchor=tk.CENTER,
             relief=tk.SOLID,
             width=38,
@@ -191,7 +201,7 @@ class PaddleOcrGui:
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
-        ttk.Label(right, text="Recognized text").grid(row=0, column=0, sticky="w")
+        ttk.Label(right, text="辨識結果").grid(row=0, column=0, sticky="w")
         text_frame = ttk.Frame(right)
         text_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
         text_frame.rowconfigure(0, weight=1)
@@ -230,12 +240,12 @@ class PaddleOcrGui:
 
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Select images or PDFs",
+            title="選擇圖片或 PDF",
             filetypes=(
-                ("Images and PDFs", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.pdf"),
-                ("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
+                ("圖片與 PDF", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.pdf"),
+                ("圖片", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
                 ("PDF", "*.pdf"),
-                ("All files", "*.*"),
+                ("所有檔案", "*.*"),
             ),
         )
         self.add_paths(paths)
@@ -255,7 +265,7 @@ class PaddleOcrGui:
         if len(self.files) == len(added):
             self.file_list.selection_set(0)
             self.preview_selected()
-        self.status_var.set(f"{len(self.files)} file(s) selected")
+        self.status_var.set(f"已選擇 {len(self.files)} 個檔案")
 
     def clear_files(self) -> None:
         if self.is_busy():
@@ -265,9 +275,9 @@ class PaddleOcrGui:
         self.file_list.delete(0, tk.END)
         self.output.delete("1.0", tk.END)
         self.preview_image = None
-        self.preview_label.configure(image="", text="No image selected")
+        self.preview_label.configure(image="", text="尚未選擇圖片")
         self.progress.configure(value=0, maximum=1)
-        self.status_var.set("Ready")
+        self.status_var.set("就緒")
 
     def refresh_file_list(self) -> None:
         self.file_list.delete(0, tk.END)
@@ -281,7 +291,7 @@ class PaddleOcrGui:
         path = self.files[selection[0]]
         if os.path.splitext(path)[1].lower() not in IMAGE_EXTENSIONS:
             self.preview_image = None
-            self.preview_label.configure(image="", text="PDF preview not shown")
+            self.preview_label.configure(image="", text="PDF 不顯示預覽")
             return
         try:
             image = Image.open(path)
@@ -291,7 +301,7 @@ class PaddleOcrGui:
             self.preview_label.configure(image=self.preview_image, text="")
         except Exception as exc:
             self.preview_image = None
-            self.preview_label.configure(image="", text=f"Preview failed: {exc}")
+            self.preview_label.configure(image="", text=f"預覽失敗：{exc}")
 
     def is_busy(self) -> bool:
         return self.worker is not None and self.worker.is_alive()
@@ -312,12 +322,12 @@ class PaddleOcrGui:
     def ensure_ocr(self, options: tuple) -> Any:
         if PaddleOCR is None:
             raise RuntimeError(
-                "paddleocr is not installed. Run: pip install paddleocr paddlepaddle"
+                "尚未安裝 paddleocr。請執行：pip install paddleocr paddlepaddle"
             )
         if self.ocr is not None and self.ocr_options == options:
             return self.ocr
         lang, use_orientation = options
-        self.events.put(("status", "Loading PaddleOCR model..."))
+        self.events.put(("status", "正在載入 PaddleOCR 模型..."))
         self.ocr = PaddleOCR(
             lang=lang,
             use_doc_orientation_classify=False,
@@ -331,17 +341,18 @@ class PaddleOcrGui:
         if self.is_busy():
             return
         if not self.files:
-            messagebox.showinfo("PaddleOCR GUI", "Add at least one image or PDF first.")
+            messagebox.showinfo("PaddleOCR", "請先加入至少一個圖片或 PDF。")
             return
 
         self.rows.clear()
         self.output.delete("1.0", tk.END)
         self.progress.configure(value=0, maximum=len(self.files))
         self.set_busy(True)
-        self.status_var.set("Starting OCR...")
+        self.status_var.set("開始辨識...")
 
         files = list(self.files)
-        options = (self.language_var.get(), bool(self.orientation_var.get()))
+        language_code = LANGUAGE_OPTIONS.get(self.language_var.get(), "chinese_cht")
+        options = (language_code, bool(self.orientation_var.get()))
         self.worker = threading.Thread(
             target=self._ocr_worker, args=(files, options), daemon=True
         )
@@ -353,7 +364,7 @@ class PaddleOcrGui:
             ocr = self.ensure_ocr(options)
             rows: List[OcrRow] = []
             for file_index, path in enumerate(files, start=1):
-                self.events.put(("status", f"Processing {os.path.basename(path)}"))
+                self.events.put(("status", f"正在辨識 {os.path.basename(path)}"))
                 results = ocr.predict(path)
                 for result in results:
                     page_index = value_from_result(result, "page_index", None)
@@ -394,12 +405,12 @@ class PaddleOcrGui:
                 self.rows = event[1]
                 self.display_rows()
                 self.set_busy(False)
-                self.status_var.set(f"Done. {len(self.rows)} text line(s) found.")
+                self.status_var.set(f"完成，辨識到 {len(self.rows)} 行文字。")
                 self.worker = None
             elif kind == "error":
                 self.set_busy(False)
                 self.worker = None
-                self.status_var.set("OCR failed")
+                self.status_var.set("OCR 失敗")
                 self.show_error(event[1], event[2])
 
         if self.is_busy():
@@ -408,7 +419,7 @@ class PaddleOcrGui:
     def display_rows(self) -> None:
         self.output.delete("1.0", tk.END)
         if not self.rows:
-            self.output.insert(tk.END, "No text found.")
+            self.output.insert(tk.END, "未辨識到文字。")
             return
 
         current_file = None
@@ -420,23 +431,23 @@ class PaddleOcrGui:
                 self.output.insert(tk.END, f"\n[{os.path.basename(row.file)}]\n")
             if row.page != current_page:
                 current_page = row.page
-                self.output.insert(tk.END, f"Page {row.page}\n")
+                self.output.insert(tk.END, f"第 {row.page} 頁\n")
             self.output.insert(tk.END, row.text + "\n")
         self.output.see("1.0")
 
     def show_error(self, message: str, details: str) -> None:
         self.output.delete("1.0", tk.END)
         self.output.insert(tk.END, details)
-        messagebox.showerror("OCR failed", message)
+        messagebox.showerror("OCR 失敗", message)
 
     def save_txt(self) -> None:
         if not self.rows:
-            messagebox.showinfo("PaddleOCR GUI", "Run OCR before saving.")
+            messagebox.showinfo("PaddleOCR", "請先執行辨識再匯出。")
             return
         path = filedialog.asksaveasfilename(
-            title="Save text",
+            title="匯出文字檔",
             defaultextension=".txt",
-            filetypes=(("Text file", "*.txt"), ("All files", "*.*")),
+            filetypes=(("文字檔", "*.txt"), ("所有檔案", "*.*")),
         )
         if not path:
             return
@@ -450,26 +461,26 @@ class PaddleOcrGui:
                     handle.write(f"\n[{os.path.basename(row.file)}]\n")
                 if row.page != current_page:
                     current_page = row.page
-                    handle.write(f"Page {row.page}\n")
+                    handle.write(f"第 {row.page} 頁\n")
                 handle.write(row.text + "\n")
-        self.status_var.set(f"Saved {path}")
+        self.status_var.set(f"已匯出：{path}")
 
     def save_xlsx(self) -> None:
         if not self.rows:
-            messagebox.showinfo("PaddleOCR GUI", "Run OCR before saving.")
+            messagebox.showinfo("PaddleOCR", "請先執行辨識再匯出。")
             return
         path = filedialog.asksaveasfilename(
-            title="Save Excel workbook",
+            title="匯出 Excel 活頁簿",
             defaultextension=".xlsx",
-            filetypes=(("Excel workbook", "*.xlsx"), ("All files", "*.*")),
+            filetypes=(("Excel 活頁簿", "*.xlsx"), ("所有檔案", "*.*")),
         )
         if not path:
             return
 
         workbook = Workbook()
         sheet = workbook.active
-        sheet.title = "OCR Results"
-        sheet.append(("File", "Page", "Line", "Text", "Score", "Box"))
+        sheet.title = "辨識結果"
+        sheet.append(("檔案", "頁數", "行號", "文字", "信心分數", "位置"))
         for row in self.rows:
             sheet.append(
                 (
@@ -482,7 +493,7 @@ class PaddleOcrGui:
                 )
             )
         workbook.save(path)
-        self.status_var.set(f"Saved {path}")
+        self.status_var.set(f"已匯出：{path}")
 
 
 def create_root() -> tk.Tk:
