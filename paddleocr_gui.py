@@ -304,12 +304,11 @@ class PaddleOcrGui:
         ):
             widget.configure(state=state)
 
-    def ensure_ocr(self) -> Any:
+    def ensure_ocr(self, options: tuple) -> Any:
         if PaddleOCR is None:
             raise RuntimeError(
                 "paddleocr is not installed. Run: pip install paddleocr paddlepaddle"
             )
-        options = (self.language_var.get(), bool(self.orientation_var.get()))
         if self.ocr is not None and self.ocr_options == options:
             return self.ocr
         lang, use_orientation = options
@@ -336,15 +335,19 @@ class PaddleOcrGui:
         self.set_busy(True)
         self.status_var.set("Starting OCR...")
 
-        self.worker = threading.Thread(target=self._ocr_worker, daemon=True)
+        files = list(self.files)
+        options = (self.language_var.get(), bool(self.orientation_var.get()))
+        self.worker = threading.Thread(
+            target=self._ocr_worker, args=(files, options), daemon=True
+        )
         self.worker.start()
         self.root.after(100, self.poll_events)
 
-    def _ocr_worker(self) -> None:
+    def _ocr_worker(self, files: List[str], options: tuple) -> None:
         try:
-            ocr = self.ensure_ocr()
+            ocr = self.ensure_ocr(options)
             rows: List[OcrRow] = []
-            for file_index, path in enumerate(self.files, start=1):
+            for file_index, path in enumerate(files, start=1):
                 self.events.put(("status", f"Processing {os.path.basename(path)}"))
                 results = ocr.predict(path)
                 for result in results:
