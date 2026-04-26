@@ -1,293 +1,493 @@
-"""PaddleOCR GUI: drag image -> OCR -> review text -> export Excel.
-
-Usage:
-    python paddleocr_gui.py
-
-Dependencies:
-    pip install paddleocr paddlepaddle pandas openpyxl pillow tkinterdnd2
-"""
+"""Tkinter GUI for running PaddleOCR on images and PDFs."""
 
 from __future__ import annotations
 
 import os
+import queue
 import threading
+import traceback
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
-from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
-try:
-    from PIL import Image, ImageTk
-except Exception:  # pragma: no cover - optional dependency fallback
-    Image = None
-    ImageTk = None
+from openpyxl import Workbook
+from PIL import Image, ImageOps, ImageTk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
-except Exception:  # pragma: no cover - optional dependency fallback
+except Exception:  # Drag and drop is optional.
     DND_FILES = None
     TkinterDnD = None
 
 try:
     from paddleocr import PaddleOCR
-except Exception:  # pragma: no cover - optional dependency fallback
+except Exception:
     PaddleOCR = None
 
-try:
-    from openpyxl import Workbook
-except Exception:  # pragma: no cover - optional dependency fallback
-    Workbook = None
+
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+INPUT_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 
 
 @dataclass
-class OcrLine:
+class OcrRow:
+    file: str
+    page: int
+    line: int
     text: str
-    score: float
-    box: list
+    score: Optional[float]
+    box: str
 
 
-class PaddleOCRApp:
-    def __init__(self, root: tk.Tk):
+def normalize_paths(paths: Iterable[str]) -> List[str]:
+    unique: List[str] = []
+    seen = set()
+    for raw_path in paths:
+        path = os.path.abspath(os.path.expanduser(raw_path.strip()))
+        if not os.path.isfile(path):
+            continue
+        if os.path.splitext(path)[1].lower() not in INPUT_EXTENSIONS:
+            continue
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique
+
+
+def value_from_result(result: Any, key: str, default: Any) -> Any:
+    if hasattr(result, "get"):
+        return result.get(key, default)
+    try:
+        return result[key]
+    except Exception:
+        return default
+
+
+def box_to_string(box: Any) -> str:
+    if box is None:
+        return ""
+    if hasattr(box, "tolist"):
+        box = box.tolist()
+    return str(box)
+
+
+class PaddleOcrGui:
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("PaddleOCR 圖片轉 Excel 工具")
-        self.root.geometry("1100x760")
+        self.root.title("PaddleOCR GUI")
+        self.root.geometry("1040x700")
+        self.root.minsize(900, 560)
 
-        self.current_image: Optional[Path] = None
-        self.preview_photo: Optional[ImageTk.PhotoImage] = None
-        self.ocr_engine: Optional[PaddleOCR] = None
+        self.files: List[str] = []
+        self.rows: List[OcrRow] = []
+        self.preview_image: Optional[ImageTk.PhotoImage] = None
+        self.ocr: Optional[Any] = None
+        self.ocr_options: Optional[tuple] = None
+        self.worker: Optional[threading.Thread] = None
+        self.events: "queue.Queue[tuple]" = queue.Queue()
+
+        self.language_var = tk.StringVar(value="ch")
+        self.orientation_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="Ready")
 
         self._build_ui()
+        self._configure_drag_drop()
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root, padding=10)
-        top.pack(fill="x")
+        outer = ttk.Frame(self.root, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=0)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        self.drop_label = ttk.Label(
-            top,
-            text="把圖片拖拉到這裡，或按『選擇圖片』",
-            relief="ridge",
-            anchor="center",
-            padding=12,
+        toolbar = ttk.Frame(outer)
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        toolbar.columnconfigure(8, weight=1)
+
+        self.add_button = ttk.Button(toolbar, text="Add Files", command=self.add_files)
+        self.add_button.grid(row=0, column=0, padx=(0, 6))
+
+        self.clear_button = ttk.Button(toolbar, text="Clear", command=self.clear_files)
+        self.clear_button.grid(row=0, column=1, padx=(0, 16))
+
+        ttk.Label(toolbar, text="Language").grid(row=0, column=2, padx=(0, 4))
+        self.language_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.language_var,
+            width=12,
+            state="readonly",
+            values=("ch", "en", "japan", "korean", "latin", "arabic", "cyrillic"),
         )
-        self.drop_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.language_box.grid(row=0, column=3, padx=(0, 12))
+        self.language_box.bind("<<ComboboxSelected>>", self._reset_ocr)
 
-        if DND_FILES and hasattr(self.drop_label, "drop_target_register"):
-            self.drop_label.drop_target_register(DND_FILES)
-            self.drop_label.dnd_bind("<<Drop>>", self._on_drop)
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind("<<Drop>>", self._on_drop)
-
-        ttk.Button(top, text="選擇圖片", command=self._choose_file).pack(side="left", padx=4)
-        ttk.Button(top, text="執行 OCR", command=self._run_ocr).pack(side="left", padx=4)
-        ttk.Button(top, text="匯出 Excel", command=self._export_excel).pack(side="left", padx=4)
-        self.auto_ocr_on_drop = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="拖拉後自動OCR", variable=self.auto_ocr_on_drop).pack(side="left", padx=8)
-
-        main = ttk.Panedwindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        left_frame = ttk.Frame(main, padding=8)
-        right_frame = ttk.Frame(main, padding=8)
-        main.add(left_frame, weight=1)
-        main.add(right_frame, weight=1)
-
-        ttk.Label(left_frame, text="圖片預覽").pack(anchor="w")
-        self.preview_canvas = tk.Canvas(left_frame, bg="#f5f5f5", width=480, height=620)
-        self.preview_canvas.pack(fill="both", expand=True)
-
-        ttk.Label(right_frame, text="OCR 結果（可手動修正）").pack(anchor="w")
-        self.text_box = tk.Text(right_frame, wrap="word", font=("Arial", 12))
-        self.text_box.pack(fill="both", expand=True)
-
-        status = ttk.Frame(self.root, padding=(10, 0, 10, 10))
-        status.pack(fill="x")
-        self.status_var = tk.StringVar(value="就緒")
-        ttk.Label(status, textvariable=self.status_var).pack(anchor="w")
-
-    def _set_status(self, text: str) -> None:
-        self.status_var.set(text)
-
-    def _choose_file(self) -> None:
-        file_path = filedialog.askopenfilename(
-            title="選擇圖片",
-            filetypes=[("Image", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff")],
+        self.orientation_check = ttk.Checkbutton(
+            toolbar,
+            text="Text orientation",
+            variable=self.orientation_var,
+            command=self._reset_ocr,
         )
-        if file_path:
-            self._load_image(Path(file_path))
+        self.orientation_check.grid(row=0, column=4, padx=(0, 16))
 
-    def _on_drop(self, event) -> None:
-        files = self._parse_dnd_files(event.data)
-        if not files:
-            messagebox.showwarning("提醒", "未讀取到可用的檔案路徑。")
+        self.run_button = ttk.Button(toolbar, text="Run OCR", command=self.run_ocr)
+        self.run_button.grid(row=0, column=5, padx=(0, 6))
+
+        self.save_txt_button = ttk.Button(
+            toolbar, text="Save TXT", command=self.save_txt
+        )
+        self.save_txt_button.grid(row=0, column=6, padx=(0, 6))
+
+        self.save_xlsx_button = ttk.Button(
+            toolbar, text="Save XLSX", command=self.save_xlsx
+        )
+        self.save_xlsx_button.grid(row=0, column=7, padx=(0, 6))
+
+        left = ttk.Frame(outer)
+        left.grid(row=1, column=0, sticky="nsw", padx=(0, 12))
+        left.rowconfigure(1, weight=1)
+
+        ttk.Label(left, text="Input files").grid(row=0, column=0, sticky="w")
+        list_frame = ttk.Frame(left)
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        self.file_list = tk.Listbox(list_frame, width=38, height=16)
+        self.file_list.grid(row=0, column=0, sticky="nsew")
+        self.file_list.bind("<<ListboxSelect>>", self.preview_selected)
+        file_scroll = ttk.Scrollbar(
+            list_frame, orient=tk.VERTICAL, command=self.file_list.yview
+        )
+        file_scroll.grid(row=0, column=1, sticky="ns")
+        self.file_list.configure(yscrollcommand=file_scroll.set)
+
+        ttk.Label(left, text="Preview").grid(row=2, column=0, sticky="w")
+        self.preview_label = ttk.Label(
+            left,
+            text="No image selected",
+            anchor=tk.CENTER,
+            relief=tk.SOLID,
+            width=38,
+        )
+        self.preview_label.grid(row=3, column=0, sticky="ew", pady=(4, 0), ipady=80)
+
+        right = ttk.Frame(outer)
+        right.grid(row=1, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        ttk.Label(right, text="Recognized text").grid(row=0, column=0, sticky="w")
+        text_frame = ttk.Frame(right)
+        text_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        self.output = tk.Text(text_frame, wrap=tk.WORD, undo=False)
+        self.output.grid(row=0, column=0, sticky="nsew")
+        output_scroll = ttk.Scrollbar(
+            text_frame, orient=tk.VERTICAL, command=self.output.yview
+        )
+        output_scroll.grid(row=0, column=1, sticky="ns")
+        self.output.configure(yscrollcommand=output_scroll.set)
+
+        bottom = ttk.Frame(outer)
+        bottom.grid(row=2, column=0, columnspan=2, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+
+        self.progress = ttk.Progressbar(bottom, mode="determinate")
+        self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        ttk.Label(bottom, textvariable=self.status_var).grid(row=0, column=1)
+
+    def _configure_drag_drop(self) -> None:
+        if TkinterDnD is None or DND_FILES is None:
             return
-        if len(files) > 1:
-            messagebox.showinfo("提醒", "一次只處理一張圖片，已使用第一個檔案。")
-        file_path = Path(files[0])
-        self._load_image(file_path)
-        if self.auto_ocr_on_drop.get():
-            self._run_ocr()
-
-    def _parse_dnd_files(self, raw_data: str) -> List[str]:
-        """Normalize drag-and-drop payload to a clean file path list."""
-        raw_data = (raw_data or "").strip()
-        if not raw_data:
-            return []
-        try:
-            parts = list(self.root.tk.splitlist(raw_data))
-        except Exception:
-            parts = [raw_data]
-        normalized = []
-        for item in parts:
-            value = item.strip()
-            if value.startswith("{") and value.endswith("}"):
-                value = value[1:-1]
-            if value:
-                normalized.append(value)
-        return normalized
-
-    def _load_image(self, path: Path) -> None:
-        if not path.exists():
-            messagebox.showerror("錯誤", f"找不到檔案：{path}")
-            return
-        if Image is None or ImageTk is None:
-            messagebox.showerror(
-                "缺少套件",
-                "載入圖片需要 Pillow。\n請安裝：pip install pillow",
-            )
-            return
-
-        self.current_image = path
-        self.drop_label.configure(text=f"目前圖片：{path.name}")
-
-        img = Image.open(path)
-        img.thumbnail((1000, 1000))
-        self.preview_photo = ImageTk.PhotoImage(img)
-
-        self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(10, 10, anchor="nw", image=self.preview_photo)
-        self._set_status(f"已載入 {path.name}")
-
-    def _ensure_engine(self) -> bool:
-        if PaddleOCR is None:
-            messagebox.showerror(
-                "缺少套件",
-                "找不到 paddleocr，請先安裝：\n"
-                "pip install paddleocr paddlepaddle",
-            )
-            return False
-
-        if self.ocr_engine is None:
-            self._set_status("初始化 PaddleOCR（第一次可能較久）...")
-            self.root.update_idletasks()
-            self.ocr_engine = PaddleOCR(use_angle_cls=True, lang="ch")
-        return True
-
-    def _run_ocr(self) -> None:
-        if not self.current_image:
-            messagebox.showwarning("提醒", "請先拖拉或選擇圖片。")
-            return
-        if not self._ensure_engine():
-            return
-
-        def worker() -> None:
+        for widget in (self.root, self.file_list):
             try:
-                self._set_status("OCR 辨識中...")
-                result = self.ocr_engine.ocr(str(self.current_image), cls=True)
-                lines = self._parse_result(result)
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self.on_drop)
+            except Exception:
+                continue
 
-                def update_ui() -> None:
-                    self.text_box.delete("1.0", "end")
-                    self.text_box.insert("1.0", "\n".join([line.text for line in lines]))
-                    self._set_status(f"完成，共辨識 {len(lines)} 行文字。")
+    def _reset_ocr(self, *_args: Any) -> None:
+        self.ocr = None
+        self.ocr_options = None
 
-                self.root.after(0, update_ui)
-            except Exception as exc:
-                self.root.after(0, lambda: messagebox.showerror("OCR 失敗", str(exc)))
-                self.root.after(0, lambda: self._set_status("OCR 失敗"))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @staticmethod
-    def _parse_result(result) -> List[OcrLine]:
-        lines: List[OcrLine] = []
-        if not result:
-            return lines
-        for block in result:
-            for entry in block:
-                box = entry[0]
-                text = entry[1][0]
-                score = float(entry[1][1])
-                lines.append(OcrLine(text=text, score=score, box=box))
-        return lines
-
-    def _export_excel(self) -> None:
-        raw_text = self.text_box.get("1.0", "end").strip()
-        if not raw_text:
-            messagebox.showwarning("提醒", "目前沒有可匯出的文字。")
-            return
-
-        save_path = filedialog.asksaveasfilename(
-            title="匯出 Excel",
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")],
-            initialfile="ocr_result.xlsx",
+    def add_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Select images or PDFs",
+            filetypes=(
+                ("Images and PDFs", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.pdf"),
+                ("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
+                ("PDF", "*.pdf"),
+                ("All files", "*.*"),
+            ),
         )
-        if not save_path:
+        self.add_paths(paths)
+
+    def on_drop(self, event: Any) -> None:
+        paths = self.root.tk.splitlist(event.data)
+        self.add_paths(paths)
+
+    def add_paths(self, paths: Iterable[str]) -> None:
+        new_paths = normalize_paths(paths)
+        existing = set(self.files)
+        added = [path for path in new_paths if path not in existing]
+        if not added:
             return
+        self.files.extend(added)
+        self.refresh_file_list()
+        if len(self.files) == len(added):
+            self.file_list.selection_set(0)
+            self.preview_selected()
+        self.status_var.set(f"{len(self.files)} file(s) selected")
 
-        rows = [line.strip() for line in raw_text.splitlines() if line.strip()]
-        self._write_excel(save_path, rows)
-        self._set_status(f"已匯出：{os.path.basename(save_path)}")
-        messagebox.showinfo("完成", f"已匯出到：\n{save_path}")
+    def clear_files(self) -> None:
+        if self.is_busy():
+            return
+        self.files.clear()
+        self.rows.clear()
+        self.file_list.delete(0, tk.END)
+        self.output.delete("1.0", tk.END)
+        self.preview_image = None
+        self.preview_label.configure(image="", text="No image selected")
+        self.progress.configure(value=0, maximum=1)
+        self.status_var.set("Ready")
 
-    @staticmethod
-    def _write_excel(save_path: str, rows: List[str]) -> None:
-        """Write OCR rows to .xlsx.
+    def refresh_file_list(self) -> None:
+        self.file_list.delete(0, tk.END)
+        for path in self.files:
+            self.file_list.insert(tk.END, os.path.basename(path))
 
-        Prefer pandas when available, otherwise fallback to openpyxl.
-        """
+    def preview_selected(self, *_args: Any) -> None:
+        selection = self.file_list.curselection()
+        if not selection:
+            return
+        path = self.files[selection[0]]
+        if os.path.splitext(path)[1].lower() not in IMAGE_EXTENSIONS:
+            self.preview_image = None
+            self.preview_label.configure(image="", text="PDF preview not shown")
+            return
         try:
-            import pandas as pd  # local import to avoid hard dependency at startup
+            image = Image.open(path)
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail((330, 260))
+            self.preview_image = ImageTk.PhotoImage(image)
+            self.preview_label.configure(image=self.preview_image, text="")
+        except Exception as exc:
+            self.preview_image = None
+            self.preview_label.configure(image="", text=f"Preview failed: {exc}")
 
-            df = pd.DataFrame({"row": list(range(1, len(rows) + 1)), "text": rows})
-            df.to_excel(save_path, index=False)
-            return
-        except Exception:
-            pass
+    def is_busy(self) -> bool:
+        return self.worker is not None and self.worker.is_alive()
 
-        if Workbook is None:
+    def set_busy(self, busy: bool) -> None:
+        state = tk.DISABLED if busy else tk.NORMAL
+        for widget in (
+            self.add_button,
+            self.clear_button,
+            self.run_button,
+            self.save_txt_button,
+            self.save_xlsx_button,
+            self.language_box,
+            self.orientation_check,
+        ):
+            widget.configure(state=state)
+
+    def ensure_ocr(self) -> Any:
+        if PaddleOCR is None:
             raise RuntimeError(
-                "匯出 Excel 需要 pandas 或 openpyxl。\n"
-                "請安裝：pip install pandas openpyxl"
+                "paddleocr is not installed. Run: pip install paddleocr paddlepaddle"
             )
+        options = (self.language_var.get(), bool(self.orientation_var.get()))
+        if self.ocr is not None and self.ocr_options == options:
+            return self.ocr
+        lang, use_orientation = options
+        self.events.put(("status", "Loading PaddleOCR model..."))
+        self.ocr = PaddleOCR(
+            lang=lang,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=use_orientation,
+        )
+        self.ocr_options = options
+        return self.ocr
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "OCR"
-        ws.append(["row", "text"])
-        for idx, text in enumerate(rows, start=1):
-            ws.append([idx, text])
-        wb.save(save_path)
+    def run_ocr(self) -> None:
+        if self.is_busy():
+            return
+        if not self.files:
+            messagebox.showinfo("PaddleOCR GUI", "Add at least one image or PDF first.")
+            return
+
+        self.rows.clear()
+        self.output.delete("1.0", tk.END)
+        self.progress.configure(value=0, maximum=len(self.files))
+        self.set_busy(True)
+        self.status_var.set("Starting OCR...")
+
+        self.worker = threading.Thread(target=self._ocr_worker, daemon=True)
+        self.worker.start()
+        self.root.after(100, self.poll_events)
+
+    def _ocr_worker(self) -> None:
+        try:
+            ocr = self.ensure_ocr()
+            rows: List[OcrRow] = []
+            for file_index, path in enumerate(self.files, start=1):
+                self.events.put(("status", f"Processing {os.path.basename(path)}"))
+                results = ocr.predict(path)
+                for result in results:
+                    page_index = value_from_result(result, "page_index", None)
+                    page = int(page_index) + 1 if page_index is not None else 1
+                    texts = value_from_result(result, "rec_texts", []) or []
+                    scores = value_from_result(result, "rec_scores", []) or []
+                    boxes = value_from_result(result, "rec_boxes", []) or []
+                    for line_index, text in enumerate(texts, start=1):
+                        score = scores[line_index - 1] if line_index - 1 < len(scores) else None
+                        box = boxes[line_index - 1] if line_index - 1 < len(boxes) else None
+                        rows.append(
+                            OcrRow(
+                                file=path,
+                                page=page,
+                                line=line_index,
+                                text=str(text),
+                                score=float(score) if score is not None else None,
+                                box=box_to_string(box),
+                            )
+                        )
+                self.events.put(("progress", file_index))
+            self.events.put(("done", rows))
+        except Exception as exc:
+            self.events.put(("error", str(exc), traceback.format_exc()))
+
+    def poll_events(self) -> None:
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            kind = event[0]
+            if kind == "status":
+                self.status_var.set(event[1])
+            elif kind == "progress":
+                self.progress.configure(value=event[1])
+            elif kind == "done":
+                self.rows = event[1]
+                self.display_rows()
+                self.set_busy(False)
+                self.status_var.set(f"Done. {len(self.rows)} text line(s) found.")
+                self.worker = None
+            elif kind == "error":
+                self.set_busy(False)
+                self.worker = None
+                self.status_var.set("OCR failed")
+                self.show_error(event[1], event[2])
+
+        if self.is_busy():
+            self.root.after(100, self.poll_events)
+
+    def display_rows(self) -> None:
+        self.output.delete("1.0", tk.END)
+        if not self.rows:
+            self.output.insert(tk.END, "No text found.")
+            return
+
+        current_file = None
+        current_page = None
+        for row in self.rows:
+            if row.file != current_file:
+                current_file = row.file
+                current_page = None
+                self.output.insert(tk.END, f"\n[{os.path.basename(row.file)}]\n")
+            if row.page != current_page:
+                current_page = row.page
+                self.output.insert(tk.END, f"Page {row.page}\n")
+            self.output.insert(tk.END, row.text + "\n")
+        self.output.see("1.0")
+
+    def show_error(self, message: str, details: str) -> None:
+        self.output.delete("1.0", tk.END)
+        self.output.insert(tk.END, details)
+        messagebox.showerror("OCR failed", message)
+
+    def save_txt(self) -> None:
+        if not self.rows:
+            messagebox.showinfo("PaddleOCR GUI", "Run OCR before saving.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save text",
+            defaultextension=".txt",
+            filetypes=(("Text file", "*.txt"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as handle:
+            current_file = None
+            current_page = None
+            for row in self.rows:
+                if row.file != current_file:
+                    current_file = row.file
+                    current_page = None
+                    handle.write(f"\n[{os.path.basename(row.file)}]\n")
+                if row.page != current_page:
+                    current_page = row.page
+                    handle.write(f"Page {row.page}\n")
+                handle.write(row.text + "\n")
+        self.status_var.set(f"Saved {path}")
+
+    def save_xlsx(self) -> None:
+        if not self.rows:
+            messagebox.showinfo("PaddleOCR GUI", "Run OCR before saving.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Excel workbook",
+            defaultextension=".xlsx",
+            filetypes=(("Excel workbook", "*.xlsx"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "OCR Results"
+        sheet.append(("File", "Page", "Line", "Text", "Score", "Box"))
+        for row in self.rows:
+            sheet.append(
+                (
+                    row.file,
+                    row.page,
+                    row.line,
+                    row.text,
+                    row.score,
+                    row.box,
+                )
+            )
+        workbook.save(path)
+        self.status_var.set(f"Saved {path}")
 
 
 def create_root() -> tk.Tk:
-    try:
-        if TkinterDnD is not None:
-            return TkinterDnD.Tk()
-        return tk.Tk()
-    except tk.TclError as exc:
-        raise RuntimeError(
-            "無法啟動 GUI：目前環境沒有可用的圖形介面（DISPLAY）。\n"
-            "請在桌面環境中執行，或設定 X11/Wayland 轉發。"
-        ) from exc
+    if TkinterDnD is not None:
+        return TkinterDnD.Tk()
+    return tk.Tk()
+
+
+def main() -> None:
+    root = create_root()
+    app = PaddleOcrGui(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    try:
-        app_root = create_root()
-        app = PaddleOCRApp(app_root)
-        app_root.mainloop()
-    except RuntimeError as err:
-        print(err)
+    main()
