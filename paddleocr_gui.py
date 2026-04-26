@@ -73,6 +73,11 @@ def value_from_result(result: Any, key: str, default: Any) -> Any:
         return default
 
 
+def sequence_from_result(result: Any, key: str) -> Any:
+    value = value_from_result(result, key, [])
+    return [] if value is None else value
+
+
 def box_to_string(box: Any) -> str:
     if box is None:
         return ""
@@ -353,9 +358,9 @@ class PaddleOcrGui:
                 for result in results:
                     page_index = value_from_result(result, "page_index", None)
                     page = int(page_index) + 1 if page_index is not None else 1
-                    texts = value_from_result(result, "rec_texts", []) or []
-                    scores = value_from_result(result, "rec_scores", []) or []
-                    boxes = value_from_result(result, "rec_boxes", []) or []
+                    texts = sequence_from_result(result, "rec_texts")
+                    scores = sequence_from_result(result, "rec_scores")
+                    boxes = sequence_from_result(result, "rec_boxes")
                     for line_index, text in enumerate(texts, start=1):
                         score = scores[line_index - 1] if line_index - 1 < len(scores) else None
                         box = boxes[line_index - 1] if line_index - 1 < len(boxes) else None
